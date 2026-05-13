@@ -1,0 +1,267 @@
+package com.avangrid.gui.avangrid_backend.config;
+
+import com.nimbusds.jose.JWSAlgorithm;
+import com.nimbusds.jose.jwk.JWKSet;
+import com.nimbusds.jose.jwk.source.ImmutableJWKSet;
+import com.nimbusds.jose.jwk.source.JWKSource;
+import com.nimbusds.jose.proc.JWSVerificationKeySelector;
+import com.nimbusds.jose.proc.SecurityContext;
+import com.nimbusds.jwt.proc.DefaultJWTProcessor;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.Customizer;
+import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.oauth2.jwt.*;
+import org.springframework.security.oauth2.server.resource.web.BearerTokenAuthenticationEntryPoint;
+import org.springframework.security.oauth2.server.resource.web.access.BearerTokenAccessDeniedHandler;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.oauth2.core.*;
+
+import java.net.URL;
+import java.util.List;
+
+/**
+ * Spring Security configuration for the VRS (VPI Recording Service) backend.
+ *
+ * <p>Configures the application as a stateless OAuth 2.0 resource server that validates
+ * Azure AD-issued JWT Bearer tokens on every request. Key responsibilities:
+ * <ul>
+ *   <li>Defines the HTTP security filter chain: CORS, CSRF, session policy, security headers,
+ *       and endpoint access rules</li>
+ *   <li>Bootstraps a {@link JwtDecoder} that pre-fetches Microsoft's public JWK signing keys
+ *       once at pod startup and holds them in memory for zero-latency validation during
+ *       request handling</li>
+ *   <li>Composes a multi-validator JWT validation pipeline: issuer, expiry, and audience checks</li>
+ * </ul>
+ *
+ * <p>All VRS API endpoints ({@code /api/v1/**}) require a valid Bearer token.
+ * OPCO-level access control is enforced by the downstream
+ * {@code OpcoAuthorizationFilter} after authentication succeeds here.
+ */
+@EnableWebSecurity
+@EnableMethodSecurity
+@Configuration
+public class SecurityConfig {
+
+    /**
+     * Content Security Policy (CSP) header value applied to all responses.
+     * Restricts resource loading to the same origin and explicitly denies framing
+     * ({@code frame-ancestors 'none'}) to prevent clickjacking attacks.
+     * Inline scripts and styles are permitted to support the embedded Swagger UI.
+     */
+    private static final String CONTENT_SECURITY_POLICY =
+            "default-src 'self'; " +
+                    "script-src 'self' 'unsafe-inline' 'unsafe-eval'; " +
+                    "style-src 'self' 'unsafe-inline'; " +
+                    "img-src 'self' data: https:; " +
+                    "font-src 'self' data:; " +
+                    "connect-src 'self'; " +
+                    "frame-ancestors 'none';";
+
+    /**
+     * HSTS (HTTP Strict Transport Security) max-age in seconds.
+     * Set to one year (365 days), instructing browsers to only contact this service over HTTPS.
+     */
+    private static final long HSTS_MAX_AGE_SECONDS = 31536000L;
+
+    /**
+     * URI patterns that are accessible without authentication.
+     * Includes Spring Boot Actuator health/info endpoints and Swagger UI documentation paths
+     * required for API exploration in non-production environments.
+     */
+    private static final String[] PUBLIC_ENDPOINTS = {
+            "/actuator/health",
+            "/actuator/info",
+            "/swagger-ui/**",
+            "/v3/api-docs/**",
+            "/biz/avangrid-backend/v1/swagger-ui/**"
+            
+    };
+
+    /**
+     * URI patterns that require a valid, authenticated JWT Bearer token.
+     * These are the core VRS recording API endpoints. OPCO-level authorisation
+     * is applied on top of authentication by the {@code OpcoAuthorizationFilter}.
+     */
+    private static final String[] AUTHENTICATED_ENDPOINTS = {
+            "/api/v1/download",
+            "/api/v1/recording",
+            "/api/v1/search",
+            "/api/v1/metadata"
+    };
+
+    /** Azure AD JWKS URI used to fetch the public RSA signing keys for JWT verification. */
+    private final String jwkSetUri;
+
+    /** Expected JWT issuer URI — validated on every token to confirm it was issued by the correct Azure AD tenant. */
+    private final String issuerUri;
+
+    /** Expected JWT audience value — validated to ensure the token was issued specifically for this application. */
+    private final String audience;
+
+    /**
+     * Constructs the security configuration with externally supplied Azure AD properties.
+     * Values are injected from application properties at startup.
+     *
+     * @param jwkSetUri  Azure AD JWKS endpoint URL (e.g., {@code https://login.microsoftonline.com/{tenant}/discovery/v2.0/keys})
+     * @param issuerUri  Expected JWT issuer URI (e.g., {@code https://login.microsoftonline.com/{tenant}/v2.0})
+     * @param audience   Expected JWT audience (the application's client ID or App ID URI registered in Azure AD)
+     */
+    public SecurityConfig(
+            @Value("${spring.security.oauth2.resourceserver.jwt.jwk-set-uri}") String jwkSetUri,
+            @Value("${spring.security.oauth2.resourceserver.jwt.issuer-uri}") String issuerUri,
+            @Value("${spring.security.oauth2.resourceserver.jwt.audience}") String audience) {
+        this.jwkSetUri = jwkSetUri;
+        this.issuerUri = issuerUri;
+        this.audience = audience;
+    }
+
+    /**
+     * Defines the HTTP {@link SecurityFilterChain} that governs all incoming requests.
+     *
+     * <p>Configuration applied:
+     * <ul>
+     *   <li><strong>CORS</strong> — uses defaults (cross-origin settings are defined separately
+     *       via a {@code CorsConfigurationSource} bean)</li>
+     *   <li><strong>CSRF</strong> — disabled; the API is stateless and authenticated via Bearer
+     *       tokens, so CSRF protection is not applicable</li>
+     *   <li><strong>Session management</strong> — {@link SessionCreationPolicy#STATELESS};
+     *       no HTTP session is created or used between requests</li>
+     *   <li><strong>Security headers</strong> — custom set with defaults disabled to allow
+     *       precise control: Cache-Control, X-Content-Type-Options, X-Frame-Options (DENY),
+     *       HSTS (1 year, include subdomains), and a strict CSP</li>
+     *   <li><strong>Endpoint authorisation</strong> — public paths are open; VRS API paths
+     *       require authentication; all other paths are denied</li>
+     *   <li><strong>OAuth2 resource server</strong> — JWT Bearer token validation with
+     *       standard 401 and 403 error handlers for missing or insufficient tokens</li>
+     * </ul>
+     *
+     * @param http Spring's {@link HttpSecurity} builder
+     * @return The configured and built {@link SecurityFilterChain}
+     * @throws Exception if any security configuration step fails
+     */
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+                .cors(Customizer.withDefaults())
+                .csrf(AbstractHttpConfigurer::disable)
+                .sessionManagement(session ->
+                        session.sessionCreationPolicy(SessionCreationPolicy.STATELESS)
+                )
+                .headers(headers -> headers
+                        .defaultsDisabled()
+                        .cacheControl(Customizer.withDefaults())
+                        .contentTypeOptions(Customizer.withDefaults())
+                        .frameOptions(frame -> frame.deny())
+                        .httpStrictTransportSecurity(hsts -> hsts
+                                .includeSubDomains(true)
+                                .maxAgeInSeconds(HSTS_MAX_AGE_SECONDS))
+                        .contentSecurityPolicy(csp -> csp.policyDirectives(CONTENT_SECURITY_POLICY))
+                )
+                .authorizeHttpRequests(auth -> auth
+                        .requestMatchers(PUBLIC_ENDPOINTS).permitAll()
+                        .requestMatchers(AUTHENTICATED_ENDPOINTS).authenticated()
+                        .anyRequest().denyAll()
+                )
+                .oauth2ResourceServer(oauth2 -> oauth2
+                        .jwt(Customizer.withDefaults())
+                        .authenticationEntryPoint(new BearerTokenAuthenticationEntryPoint())
+                        .accessDeniedHandler(new BearerTokenAccessDeniedHandler())
+                );
+
+        return http.build();
+    }
+
+    /**
+     * Creates and configures the {@link JwtDecoder} bean used by Spring Security to validate
+     * every incoming Bearer token against Azure AD's public signing keys.
+     *
+     * <p>Key design decisions:
+     * <ul>
+     *   <li><strong>Keys fetched once at startup</strong> — {@link JWKSet#load(URL)} makes a
+     *       single network call to the Azure AD JWKS endpoint when the Spring context initialises.
+     *       The keys are stored in an {@link ImmutableJWKSet}, eliminating network round-trips
+     *       on every request and reducing latency during JWT verification.</li>
+     *   <li><strong>Key rotation</strong> — Microsoft rotates signing keys approximately every
+     *       six weeks. Because the keys are loaded at pod startup, a pod restart (or rolling
+     *       deployment) automatically picks up the new keys. No additional key-refresh mechanism
+     *       is required for normal rotation cycles.</li>
+     *   <li><strong>Algorithm</strong> — RS256 ({@link JWSAlgorithm#RS256}) is enforced via
+     *       {@link JWSVerificationKeySelector}, rejecting tokens signed with any other algorithm.</li>
+     *   <li><strong>Validation chain</strong> — three validators are composed via
+     *       {@link DelegatingOAuth2TokenValidator}:
+     *       issuer ({@link JwtIssuerValidator}), expiry ({@link JwtTimestampValidator}),
+     *       and audience ({@link #createAudienceValidator()}).</li>
+     * </ul>
+     *
+     * @return A configured {@link NimbusJwtDecoder} ready to validate Azure AD JWTs
+     * @throws Exception if the JWKS endpoint URL is malformed or the initial key fetch fails
+     */
+    @Bean
+    public JwtDecoder jwtDecoder() throws Exception {
+        // Fetch keys ONCE at pod startup from Microsoft.
+        // ImmutableJWKSet holds them in memory — zero network calls during request handling.
+        // When Microsoft rotates keys (~6 weeks), a pod restart picks up the new keys automatically.
+        JWKSet jwkSet = JWKSet.load(new URL(jwkSetUri));
+
+        JWKSource<SecurityContext> jwkSource = new ImmutableJWKSet<>(jwkSet);
+
+        DefaultJWTProcessor<SecurityContext> jwtProcessor = new DefaultJWTProcessor<>();
+        jwtProcessor.setJWSKeySelector(
+                new JWSVerificationKeySelector<>(JWSAlgorithm.RS256, jwkSource)
+        );
+
+        NimbusJwtDecoder decoder = new NimbusJwtDecoder(jwtProcessor);
+
+        decoder.setJwtValidator(new DelegatingOAuth2TokenValidator<>(
+                new JwtIssuerValidator(issuerUri),
+                new JwtTimestampValidator(),
+                createAudienceValidator()
+        ));
+
+        return decoder;
+    }
+
+    /**
+     * Creates a custom {@link OAuth2TokenValidator} that enforces the expected JWT audience claim.
+     *
+     * <p>The validator checks that the token's {@code aud} claim contains the configured
+     * {@link #audience} value (the application's Azure AD client ID or App ID URI).
+     * This prevents tokens issued for other applications in the same tenant from being
+     * accepted by the VRS backend.
+     *
+     * <p>Failure outcomes:
+     * <ul>
+     *   <li>Missing or empty {@code aud} claim → validation failure with error
+     *       {@code "Token must contain audience claim"}</li>
+     *   <li>{@code aud} present but does not contain the expected value → validation failure
+     *       with a message listing the actual audiences received</li>
+     * </ul>
+     *
+     * @return A lambda-based {@link OAuth2TokenValidator} that validates the {@code aud} claim
+     */
+    private OAuth2TokenValidator<Jwt> createAudienceValidator() {
+        return jwt -> {
+            List<String> audiences = jwt.getAudience();
+            if (audiences == null || audiences.isEmpty()) {
+                return OAuth2TokenValidatorResult.failure(
+                        new OAuth2Error("invalid_token", "Token must contain audience claim", null)
+                );
+            }
+            if (audiences.contains(audience)) {
+                return OAuth2TokenValidatorResult.success();
+            }
+            return OAuth2TokenValidatorResult.failure(
+                    new OAuth2Error("invalid_token",
+                            String.format("Token audience '%s' does not match required audience '%s'",
+                                    audiences, audience),
+                            null)
+            );
+        };
+    }
+}
